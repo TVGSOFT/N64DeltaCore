@@ -3,7 +3,7 @@
 	url = https://github.com/rileytestut/mupen64plus-core.git
 [submodule "Mupen64Plus/GLideN64"]
 	path = Mupen64Plus/GLideN64
-	url = https://github.com/rileytestut/GLideN64.git
+	url = git@github.com:TVGSOFT/GLideN64.git
 [submodule "Mupen64Plus/libpng"]
 	path = Mupen64Plus/libpng
 	url = git://git.code.sf.net/p/libpng/code
