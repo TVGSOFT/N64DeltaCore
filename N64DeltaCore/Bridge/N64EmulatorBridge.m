@@ -74,6 +74,11 @@ void CALL RSP_RomClosed(void);
 @property (nonatomic) BOOL didLoadPlugins;
 @property (nonatomic, assign, getter=isRunning) BOOL running;
 
+// YES only between a successful startWithGameURL: and stop. EmulatorCore keeps driving the bridge
+// (game save, frames, save states, stop) even when the ROM failed to open, and without a live
+// main_run() the cart storage pointers are NULL or dangle into a dead thread's stack.
+@property (atomic, assign, getter=isGameLoaded) BOOL gameLoaded;
+
 @property (nonatomic, strong, readonly) NSMutableDictionary<NSNumber *, void (^)(void)> *stateCallbacks;
 
 @property (nonatomic, strong, readwrite) AVAudioFormat *preferredAudioFormat;
@@ -313,6 +318,7 @@ static void MupenSetAudioSpeed(int percent)
 - (void)startWithGameURL:(NSURL *)gameURL
 {
     self.gameURL = gameURL;
+    self.gameLoaded = NO;
     
     /* Copy .ini files */
     NSArray<NSString *> *iniFiles = @[@"GLideN64", @"GLideN64.custom", @"mupen64plus"];
@@ -458,6 +464,8 @@ static void MupenSetAudioSpeed(int percent)
     [thread start];
     
     dispatch_semaphore_wait(self.endFrameSemaphore, DISPATCH_TIME_FOREVER);
+    
+    self.gameLoaded = YES;
 }
 
 - (void)startEmulationLoop
@@ -474,6 +482,15 @@ static void MupenSetAudioSpeed(int percent)
 
 - (void)stop
 {
+    if (![self isGameLoaded])
+    {
+        // Nothing is running: there is no emulation thread to signal stopEmulationSemaphore.
+        self.running = NO;
+        return;
+    }
+    
+    self.gameLoaded = NO;
+    
     CoreDoCommand(M64CMD_STOP, 0, NULL);
     
     dispatch_semaphore_signal(self.beginFrameSemaphore);
@@ -500,6 +517,11 @@ static void MupenSetAudioSpeed(int percent)
 
 - (void)runFrameAndProcessVideo:(BOOL)processVideo
 {
+    if (![self isGameLoaded])
+    {
+        return;
+    }
+    
     dispatch_semaphore_signal(self.beginFrameSemaphore);
     
     dispatch_semaphore_wait(self.endFrameSemaphore, DISPATCH_TIME_FOREVER);
@@ -550,6 +572,11 @@ static void MupenSetAudioSpeed(int percent)
 
 - (void)saveSaveStateToURL:(NSURL *)url
 {
+    if (![self isGameLoaded])
+    {
+        return;
+    }
+    
     dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
     
     [self registerCallbackForType:M64CORE_STATE_SAVECOMPLETE callback:^{
@@ -568,6 +595,11 @@ static void MupenSetAudioSpeed(int percent)
 
 - (void)loadSaveStateFromURL:(NSURL *)url
 {
+    if (![self isGameLoaded])
+    {
+        return;
+    }
+    
     dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
     
     [self registerCallbackForType:M64CORE_STATE_LOADCOMPLETE callback:^{
@@ -588,19 +620,10 @@ static void MupenSetAudioSpeed(int percent)
 
 - (void)saveGameSaveToURL:(NSURL *)url
 {
-    struct file_storage *storage = NULL;
-    
-    if (g_dev.cart.use_flashram == -1)
+    struct file_storage *storage = [self activeGameSaveStorage];
+    if (storage == NULL)
     {
-        storage = (struct file_storage *)g_dev.cart.sram.storage;
-    }
-    else if (g_dev.cart.use_flashram == 0)
-    {
-        storage = (struct file_storage *)g_dev.cart.eeprom.storage;
-    }
-    else if (g_dev.cart.use_flashram == 1)
-    {
-        storage = (struct file_storage *)g_dev.cart.flashram.storage;
+        return;
     }
     
     NSData *data = [NSData dataWithBytes:storage->data length:storage->size];
@@ -609,6 +632,27 @@ static void MupenSetAudioSpeed(int percent)
 
 - (void)loadGameSaveFromURL:(NSURL *)url
 {
+    struct file_storage *storage = [self activeGameSaveStorage];
+    if (storage == NULL)
+    {
+        return;
+    }
+    
+    NSData *saveData = [NSData dataWithContentsOfURL:url];
+    
+    // The file may be shorter than the cart storage (truncated or a different save type).
+    size_t length = MIN((size_t)saveData.length, storage->size);
+    memcpy(storage->data, saveData.bytes, length);
+    memset(storage->data + length, 0xFF, storage->size - length);
+}
+
+- (nullable struct file_storage *)activeGameSaveStorage
+{
+    if (![self isGameLoaded])
+    {
+        return NULL;
+    }
+    
     struct file_storage *storage = NULL;
     
     if (g_dev.cart.use_flashram == -1)
@@ -624,15 +668,12 @@ static void MupenSetAudioSpeed(int percent)
         storage = (struct file_storage *)g_dev.cart.flashram.storage;
     }
     
-    NSData *saveData = [NSData dataWithContentsOfURL:url];
-    if (saveData == nil)
+    if (storage == NULL || storage->data == NULL)
     {
-        memset(storage->data, 0xFF, storage->size);
+        return NULL;
     }
-    else
-    {
-        memcpy(storage->data, saveData.bytes, storage->size);
-    }
+    
+    return storage;
 }
 
 #pragma mark - Cheats -
